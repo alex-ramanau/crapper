@@ -1,6 +1,6 @@
 # crapper
 
-CRAP scores for Clojure, Java, Go, TypeScript, Rust, and Python. One run detects the language of each source file, applies that language's complexity and coverage rules, and writes the snapshot [uml-viewer](https://github.com/unclebob/uml-viewer) already reads.
+CRAP scores for Clojure, Java, Go, TypeScript, Rust, Python, and Ruby. One run detects the language of each source file, applies that language's complexity and coverage rules, and writes the snapshot [uml-viewer](https://github.com/unclebob/uml-viewer) already reads.
 
 The formula is the one from [crap4clj](https://github.com/unclebob/crap4clj), [crap4java](https://github.com/unclebob/crap4java), and [crap4go](https://github.com/unclebob/crap4go):
 
@@ -52,6 +52,7 @@ uml-viewer groups entries by `:namespace` and joins each operation on `:name`. `
 | TypeScript | the dotted module path, or `module.Class` | the function or method name |
 | Rust | `crate::module`, or `crate::module::Type` | the function or method name |
 | Python | the dotted module path, or `module.Class` | the function or method name |
+| Ruby | `Module::Class`, or the file path (`demo/util`) outside any class | the method name, or `self.name` for a singleton method |
 
 Rename or move is a new entry. There is no identity matching across runs.
 
@@ -69,6 +70,8 @@ Rust counts `if`, loops, each `match` arm, `?`, and `&&` / `||`. `mod tests` is 
 
 Python counts `if`, `elif`, `for`, `while`, `except`, each `match` case, a comprehension filter, a conditional expression, and each `and` / `or`. Nested functions stay inside the enclosing function. Coverage is LCOV from `coverage.py`, running pytest when the project uses it and `unittest` otherwise. `coverage` and `pytest` are installed into the project's interpreter when they are missing.
 
+Ruby counts `if`, `elsif`, `unless`, `while`, `until`, `for`, each `rescue`, each `when` and `in` clause, a pattern guard, the ternary, the modifier forms (`x if y`, `x rescue nil`, ...), each `&&` / `||` / `and` / `or`, safe navigation `&.`, and `||=` / `&&=`. `def` and `def self.` are entries. A method inside `class << self` is `self.name` too. Blocks, lambdas, and nested `def`s stay inside the enclosing method. The namespace is the lexical `module` / `class` nesting, so `class A::B` is `A::B`. A method outside any class is namespaced by its path without `lib/` or `src/` and `.rb`. `*_spec.rb`, `*_test.rb`, and `test_*.rb` are tests. Coverage comes from Ruby's built-in `Coverage` (lines and branches): crapper loads a small shim through `RUBYOPT` that writes a SimpleCov-shaped `.resultset.json` per process, so no gem is installed and the `Gemfile` is untouched. A project whose bundle already has SimpleCov keeps it, and crapper reads `coverage/.resultset.json`. A function's score uses its branches when it has any and its lines otherwise.
+
 ## Coverage commands
 
 By default a run deletes the previous report for each language it is about to measure and regenerates it:
@@ -81,6 +84,7 @@ By default a run deletes the previous report for each language it is about to me
 | TypeScript | `npm run coverage`, or Vitest `--coverage`, or `npx c8 ... npm test` | `coverage/lcov.info` or `target/coverage/typescript/lcov.info` |
 | Rust | `cargo llvm-cov` or `cargo tarpaulin`, per Cargo package | `target/coverage/rust/lcov.info` |
 | Python | `coverage run` with pytest or unittest, then `coverage lcov` | `target/coverage/python/lcov.info` |
+| Ruby | `rspec` with `spec/` or `.rspec`, else `rake test`, else each file in `test/`; `bundle exec` with a `Gemfile` | `target/coverage/ruby/.resultset-<pid>.json`, or SimpleCov's `coverage/.resultset.json` |
 
 A missing tool or a failed test run scores that language at 0% and still writes the snapshot. Pass `--coverage-command` to replace those defaults with one command of your own. `--no-coverage` is the run that leaves coverage and CRAP as N/A.
 
@@ -91,3 +95,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
 .venv/bin/pytest
 ```
+
+The Ruby test that runs the coverage shim under a real interpreter is skipped when `ruby` is not on `PATH`.
+
+Experimental Ruby support was added with the help of Claude Opus 5.5.

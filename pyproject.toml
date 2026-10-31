@@ -1,7 +1,7 @@
 [project]
 name = "crapper"
 version = "0.1.0"
-description = "CRAP scores for Clojure, Java, Go, TypeScript, Rust, and Python, in the snapshot uml-viewer reads."
+description = "CRAP scores for Clojure, Java, Go, TypeScript, Rust, Python, and Ruby, in the snapshot uml-viewer reads."
 readme = "README.md"
 license = { file = "LICENSE" }
 classifiers = ["License :: OSI Approved :: Zero-Clause BSD (0BSD)"]
@@ -23,6 +23,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+crapper = ["ruby/*.rb"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

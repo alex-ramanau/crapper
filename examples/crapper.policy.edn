@@ -5,7 +5,7 @@
  :out "examples/crapper.edn"
  :hierarchical true
  :foreign [dataclasses functools json os pathlib re shlex shutil subprocess sys
-           tree_sitter_language_pack urllib xml]
+           tempfile tree_sitter_language_pack urllib xml]
  :order [model discover crapper
          crap coverage metrics report languages
          analyze runners

@@ -1,13 +1,16 @@
-"""Load Cloverage, LCOV, JaCoCo, and Go coverage profiles.
+"""Load Cloverage, LCOV, JaCoCo, Go, and SimpleCov coverage reports.
 
 Clojure prefers Cloverage's per-line form counts, then LCOV. Java uses JaCoCo
-instruction counters. Go uses statement profiles. LCOV scores a function by
-its BRDA branch records when it has any, and by line hits otherwise.
+instruction counters. Go uses statement profiles. Ruby's SimpleCov
+`.resultset.json` is read into the same per-file records as LCOV. LCOV scores
+a function by its BRDA branch records when it has any, and by line hits
+otherwise.
 `percent_for` returns None when the file is absent; analysis turns that into 0%.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -22,6 +25,9 @@ _SPAN = re.compile(
 _LCOV_DA = re.compile(r"DA:(\d+),(\d+)")
 _LCOV_BRDA = re.compile(r"BRDA:(\d+),([^,]*),([^,]*),(-|\d+)")
 _DOCTYPE = re.compile(r"<!DOCTYPE[^>]*>", re.IGNORECASE)
+# Ruby's Coverage keys a branch as `[:type, id, start_line, start_col, end_line, end_col]`.
+# Safe navigation is quoted: `[:"&.", 0, 3, 4, 3, 9]`.
+_RUBY_BRANCH = re.compile(r'\[:?(?:"[^"]*"|\w+), *\d+, *(\d+),')
 
 
 class FileCoverage(dict):
@@ -297,6 +303,84 @@ def branch_percent(record, start: int, end: int) -> float | None:
     return coverage_percent(covered, total)
 
 
+def _ruby_line(key: str) -> int | None:
+    match = _RUBY_BRANCH.match(key)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _add_ruby_lines(record: FileCoverage, lines) -> None:
+    if not isinstance(lines, list):
+        return
+    for index, hits in enumerate(lines):
+        if not isinstance(hits, int):
+            continue
+        line = index + 1
+        covered = 1 if hits > 0 or record.get(line, (0, 0))[0] else 0
+        record[line] = (covered, 1)
+
+
+def _add_ruby_branches(record: FileCoverage, branches, hits: dict) -> None:
+    """Each outcome of a condition is one branch, on the condition's line."""
+
+    if not isinstance(branches, dict):
+        return
+    for condition, outcomes in branches.items():
+        line = _ruby_line(condition)
+        if line is None or not isinstance(outcomes, dict):
+            continue
+        for outcome, count in outcomes.items():
+            key = (line, condition, outcome)
+            taken = isinstance(count, int) and count > 0
+            hits[key] = hits.get(key, False) or taken
+
+
+def _ruby_file(entry, record: FileCoverage, hits: dict) -> None:
+    if isinstance(entry, list):
+        # SimpleCov before 0.18 stored the line array directly.
+        _add_ruby_lines(record, entry)
+        return
+    if isinstance(entry, dict):
+        _add_ruby_lines(record, entry.get("lines"))
+        _add_ruby_branches(record, entry.get("branches"), hits)
+
+
+def _store_ruby_branches(out: dict[str, FileCoverage], hits: dict[str, dict]) -> None:
+    for path, branch_hits in hits.items():
+        record = out[path]
+        record.branches = {}
+        for (line, _condition, _outcome), taken in branch_hits.items():
+            _add_branch(record, line, "1" if taken else "0")
+
+
+def parse_simplecov(texts: list[str]) -> dict[str, FileCoverage]:
+    """Merge SimpleCov `.resultset.json` documents into per-file records.
+
+    A resultset maps each suite name to `{"coverage": {path: {"lines": [...],
+    "branches": {...}}}}`. A line or branch hit in any suite is covered.
+    """
+
+    out: dict[str, FileCoverage] = {}
+    hits: dict[str, dict] = {}
+    for text in texts:
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        for suite in data.values():
+            files = suite.get("coverage") if isinstance(suite, dict) else None
+            if not isinstance(files, dict):
+                continue
+            for path, entry in files.items():
+                record = out.setdefault(path, FileCoverage())
+                _ruby_file(entry, record, hits.setdefault(path, {}))
+    _store_ruby_branches(out, hits)
+    return out
+
+
 def parse_go_profile(text: str) -> dict[str, list[tuple[int, int, int, int]]]:
     """Map file → (start_line, end_line, statements, hits)."""
 
@@ -517,6 +601,17 @@ def _merge_lcov(root: Path) -> dict[str, dict[int, tuple[int, int]]]:
     return merged
 
 
+def _simplecov_paths(root: Path) -> list[Path]:
+    paths = list(root.glob("target/coverage/ruby/**/.resultset*.json"))
+    paths.append(root / "coverage" / ".resultset.json")
+    paths.extend(root.glob("*/coverage/.resultset.json"))
+    return paths
+
+
+def _merge_simplecov(root: Path) -> dict[str, FileCoverage]:
+    return parse_simplecov(_merge_texts(_simplecov_paths(root)))
+
+
 def _merge_go(root: Path) -> dict[str, list[tuple[int, int, int, int]]]:
     paths = [
         root / "target" / "coverage" / "coverage.out",
@@ -561,8 +656,10 @@ def _merge_forms(root: Path) -> dict[str, dict[int, tuple[int, int]]]:
 def load_bundle(root: Path) -> CoverageBundle:
     go_profile = _merge_go(root)
     jacoco = _merge_jacoco(root)
+    lcov = _merge_simplecov(root)
+    lcov.update(_merge_lcov(root))
     return CoverageBundle(
-        lcov=_merge_lcov(root),
+        lcov=lcov,
         go_profile=go_profile or None,
         jacoco=jacoco or None,
         form_html=_merge_forms(root),

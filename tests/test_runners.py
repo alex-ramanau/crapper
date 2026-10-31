@@ -483,7 +483,7 @@ def test_python_coverage_module_missing_is_reported(tmp_path, monkeypatch, capsy
 def test_an_argument_vector_is_not_a_shell(tmp_path, monkeypatch):
     seen = []
 
-    def fake(command, cwd, shell=False):
+    def fake(command, cwd, shell=False, env=None):
         seen.append((command, shell))
 
         class Done:
