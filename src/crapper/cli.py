@@ -79,7 +79,7 @@ Coverage, when it is produced:
   TypeScript   npm run coverage, Vitest's own LCOV, or c8 around npm test
   Rust         cargo llvm-cov, or cargo tarpaulin, in the nearest Cargo.toml
   Python       coverage.py LCOV, via pytest or unittest, per project
-  Ruby         Ruby's Coverage (or the project's SimpleCov) around rspec,
+  Ruby         Ruby's Coverage, shared with SimpleCov, around rspec,
                rake test, or test/, per Gemfile or gemspec
 
 uml-viewer joins .metrics/crap.edn on :namespace and :name.

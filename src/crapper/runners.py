@@ -412,7 +412,6 @@ _RUBY_TEST_LOADER = (
 
 
 _GEMFILES = ("Gemfile", "gems.rb")
-_BUNDLE_FILES = ("Gemfile.lock", "Gemfile", "gems.rb", "gems.locked")
 
 
 def _is_ruby_package(directory: Path) -> bool:
@@ -450,26 +449,14 @@ def ruby_roots(root: Path, files: list[Path]) -> list[Path]:
     return sorted(found)
 
 
-def _bundle_texts(package: Path, root: Path):
-    for directory in _ancestors(package.resolve(), root):
-        for name in _BUNDLE_FILES:
-            path = directory / name
-            if path.is_file():
-                yield name, path.read_text(encoding="utf-8", errors="replace")
-
-
-def uses_simplecov(package: Path, root: Path | None = None) -> bool:
-    """A project that starts SimpleCov itself keeps it. Ruby allows one Coverage run.
-
-    Bundler finds a Gemfile in a parent directory, so the parents up to the
-    project root count too.
-    """
-
-    return any("simplecov" in text for _name, text in _bundle_texts(package, root or package))
-
-
 def _bundled(package: Path, root: Path) -> bool:
-    return any(name in _GEMFILES for name, _text in _bundle_texts(package, root))
+    """Bundler finds a Gemfile in a parent directory too."""
+
+    return any(
+        (directory / name).is_file()
+        for directory in _ancestors(package.resolve(), root)
+        for name in _GEMFILES
+    )
 
 
 def ruby_test_command(package: Path, root: Path | None = None) -> list[str] | None:
@@ -676,12 +663,16 @@ def _cover_rust(root: Path, files: list[Path]) -> None:
             _warn(f"Rust coverage exited {code} in {module}. Rust coverage will score 0%.")
 
 
-def _ruby_env(root: Path, package: Path) -> dict[str, str] | None:
-    """The shim's environment, or None when the project's SimpleCov runs instead."""
+def _ruby_env(root: Path, package: Path) -> dict[str, str]:
+    """The shim's environment. A project that starts SimpleCov joins the
+    shim's Coverage session, so the shim always runs.
 
-    if uses_simplecov(package, root):
-        (package / "coverage" / ".resultset.json").unlink(missing_ok=True)
-        return None
+    SimpleCov's own resultset is removed first: when this run does not start
+    SimpleCov (RuboCop only starts it under `COVERAGE=1 rake`), a leftover
+    one would count as coverage from this run.
+    """
+
+    (package / "coverage" / ".resultset.json").unlink(missing_ok=True)
     report_dir = _coverage_report(root, package, "ruby").parent
     _clear_resultsets(report_dir)
     report_dir.mkdir(parents=True, exist_ok=True)

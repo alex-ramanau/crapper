@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from crapper.coverage import load_bundle, parse_simplecov
+from crapper.coverage import CoverageBundle, load_bundle, parse_simplecov
 from crapper.discover import is_test_file, iter_source_files, language_of
 from crapper.languages.ruby import functions_in_source
 from crapper.model import Function
@@ -17,7 +17,6 @@ from crapper.runners import (
     ruby_roots,
     ruby_test_command,
     run_coverage,
-    uses_simplecov,
 )
 
 
@@ -301,14 +300,6 @@ def test_ruby_test_command_picks_the_runner(tmp_path):
     assert ruby_test_command(tmp_path) == ["bundle", "exec", "rspec"]
 
 
-def test_simplecov_is_detected_from_the_bundle(tmp_path):
-    assert not uses_simplecov(tmp_path)
-    _touch(tmp_path / "Gemfile", "gem 'rspec'\n")
-    assert not uses_simplecov(tmp_path)
-    _touch(tmp_path / "Gemfile.lock", "    simplecov (0.22.0)\n")
-    assert uses_simplecov(tmp_path)
-
-
 def test_coverage_env_appends_the_shim(tmp_path):
     env = ruby_coverage_env(tmp_path, tmp_path / "out", {"RUBYOPT": "-W0", "PATH": "/bin"})
     assert env["RUBYOPT"] == f"-W0 -r{_RUBY_SHIM}"
@@ -335,7 +326,7 @@ def test_clear_resultsets_keeps_nested_packages(tmp_path):
     assert not own.exists() and nested.exists() and other.exists()
 
 
-def test_cover_ruby_runs_with_the_shim_or_the_projects_simplecov(tmp_path, monkeypatch, capsys):
+def test_cover_ruby_always_runs_with_the_shim(tmp_path, monkeypatch, capsys):
     calls = []
 
     def fake(command, cwd, env=None):
@@ -353,10 +344,13 @@ def test_cover_ruby_runs_with_the_shim_or_the_projects_simplecov(tmp_path, monke
     assert not stale.exists()
     assert "Ruby tests exited 3" in capsys.readouterr().err
 
-    _touch(tmp_path / "Gemfile.lock", "simplecov\n")
+    # A Gemfile naming SimpleCov does not mean this run starts it (RuboCop
+    # only does under COVERAGE=1 rake), so the shim still runs, and a
+    # leftover SimpleCov resultset is removed.
+    _touch(tmp_path / "Gemfile.lock", "    simplecov (1.2.0)\n")
     old = _touch(tmp_path / "coverage" / ".resultset.json")
     _cover_ruby(tmp_path, [source])
-    assert calls[-1] == (["rspec"], tmp_path.resolve(), None)
+    assert calls[-1][2]["RUBYOPT"].endswith(f"-r{_RUBY_SHIM}")
     assert not old.exists()
 
 
@@ -375,6 +369,7 @@ def test_shim_records_lines_and_branches_from_a_real_ruby(tmp_path):
     _touch(tmp_path / "test" / "box_test.rb", "require 'box'\npick(true)\n")
     _touch(tmp_path / "vendor" / "skip.rb", "1\n")
     out = tmp_path / "out"
+    out.mkdir()
     env = ruby_coverage_env(tmp_path, out)
     script = "require 'box'; require_relative 'vendor/skip'; pick(true); fork { pick(false) }; Process.wait"
     subprocess.run(["ruby", "-Ilib", "-e", script], cwd=tmp_path, env=env, check=True)
@@ -426,10 +421,6 @@ def test_a_monorepo_runs_each_gemspec_component(tmp_path):
     assert ruby_roots(tmp_path, [source, tool]) == [tmp_path.resolve(), support.resolve()]
     assert ruby_test_command(support, tmp_path) == ["bundle", "exec", "rake", "test"]
     assert ruby_test_command(support) == ["rake", "test"]
-    assert not uses_simplecov(support, tmp_path)
-    _touch(tmp_path / "Gemfile.lock", "    simplecov (0.22.0)\n")
-    assert uses_simplecov(support, tmp_path)
-    assert not uses_simplecov(support)
 
 
 def test_a_custom_command_records_ruby_coverage(tmp_path, monkeypatch):
@@ -447,3 +438,111 @@ def test_a_custom_command_records_ruby_coverage(tmp_path, monkeypatch):
     assert not stale.exists() and not nested.exists()
     run_coverage(tmp_path, [_touch(tmp_path / "web" / "a.py")], "pytest")
     assert calls[-1] == ("pytest", None)
+
+
+@pytest.mark.skipif(shutil.which("ruby") is None, reason="ruby is not installed")
+def test_shim_shares_coverage_with_a_tool_that_takes_the_result(tmp_path):
+    """SimpleCov starts Coverage again and takes the result at exit. Both must work."""
+
+    lib = _touch(tmp_path / "lib" / "box.rb", "def pick(x)\n  x ? 1 : 0\nend\n")
+    script = (
+        "Coverage.start(lines: true)\n"
+        "at_exit { $stdout.puts Coverage.result.keys.grep(/box/).size }\n"
+        "require 'box'\n"
+        "pick(true)\n"
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    done = subprocess.run(
+        ["ruby", "-Ilib", "-e", script],
+        cwd=tmp_path, env=ruby_coverage_env(tmp_path, out), capture_output=True, text=True,
+    )
+    assert (done.returncode, done.stdout, done.stderr) == (0, "1\n", "")
+    texts = [path.read_text() for path in out.glob(".resultset-*.json")]
+    record = parse_simplecov(texts)[str(lib.resolve())]
+    assert dict(record) == {1: (1, 1), 2: (1, 1)}
+    assert record.branches == {2: (1, 2)}
+
+
+@pytest.mark.skipif(shutil.which("ruby") is None, reason="ruby is not installed")
+def test_shim_starts_before_a_bundler_setup_that_rubygems_loads(tmp_path):
+    """Bundler exports BUNDLER_SETUP and RubyGems requires it while booting,
+    before RUBYOPT. A stand-in setup loads the gem's version file, as
+    bundler/setup does through the gemspec, then exports itself again."""
+
+    version = _touch(tmp_path / "lib" / "gem_version.rb", "def gem_version(x)\n  x ? 1 : 0\nend\n")
+    setup = _touch(
+        tmp_path / "fake_setup.rb",
+        "module Bundler; end\n"
+        f"ENV['BUNDLER_SETUP'] = {str(tmp_path / 'fake_setup.rb')!r}\n"
+        "require_relative 'lib/gem_version'\n",
+    )
+    out = tmp_path / "out"
+    out.mkdir()
+    env = ruby_coverage_env(tmp_path, out)
+    # `bundle exec` sets BUNDLER_SETUP, then Kernel.exec runs the command.
+    parent = (
+        f"ENV['BUNDLER_SETUP'] = {str(setup)!r}\n"
+        "Kernel.exec('ruby', '-e', 'gem_version(true); "
+        "system(%q(ruby), %q(-e), %q(print ENV[%q(BUNDLER_SETUP)] == $LOADED_FEATURES.grep(/crapper_coverage/).first))')"
+    )
+    done = subprocess.run(["ruby", "-e", parent], cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert (done.returncode, done.stderr) == (0, "")
+    assert done.stdout == "true", "a grandchild also boots with the shim as BUNDLER_SETUP"
+    record = parse_simplecov([path.read_text() for path in out.glob(".resultset-*.json")])[str(version.resolve())]
+    assert dict(record) == {1: (1, 1), 2: (1, 1)}
+    assert record.branches == {2: (1, 2)}
+
+
+@pytest.mark.skipif(shutil.which("ruby") is None, reason="ruby is not installed")
+def test_shim_does_not_load_json_before_bundler(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    done = subprocess.run(
+        ["ruby", "-e", "print defined?(JSON).inspect, ' ', defined?(FileUtils).inspect"],
+        cwd=tmp_path, env=ruby_coverage_env(tmp_path, out), capture_output=True, text=True,
+    )
+    assert done.stdout == "nil nil"
+    assert len(list(out.glob(".resultset-*.json"))) == 1
+
+
+def test_a_never_called_ruby_method_is_zero_even_though_its_def_line_ran(tmp_path):
+    path = str(tmp_path / "lib" / "a.rb")
+    lines = [1, 1, 0, 0, None, None, 1, 1, None, None]
+    methods = {
+        "[A, :never, 2, 2, 5, 5]": 0,
+        "[A, :once, 7, 2, 9, 5]": 1,
+        "[#<Class:A>, :build, 7, 2, 9, 5]": 0,
+        "not a method": 1,
+        "[A, :odd, 1, 0, 1, 9]": "x",
+    }
+    first = _resultset(path, lines)
+    second = json.dumps({"S": {"coverage": {path: {"lines": lines, "methods": methods}}}})
+    record = parse_simplecov([first, second])[path]
+    assert record.methods == {2: False, 7: True, 1: False}
+    bundle = CoverageBundle(lcov={path: record})
+    never = Function("never", "A", 1, 2, 5, path, "ruby")
+    once = Function("once", "A", 1, 7, 9, path, "ruby")
+    unrecorded = Function("other", "A", 1, 10, 10, path, "ruby")
+    assert bundle.percent_for(never) == 0.0
+    assert bundle.percent_for(once) == 100.0
+    assert bundle.percent_for(unrecorded) == 0.0
+
+
+@pytest.mark.skipif(shutil.which("ruby") is None, reason="ruby is not installed")
+def test_shim_scores_a_never_called_branchless_method_at_zero(tmp_path):
+    source = "class A\n  def never(x)\n    y = x + 1\n    y * 2\n  end\n\n  def once(x)\n    x + 1\n  end\nend\n"
+    lib = _touch(tmp_path / "lib" / "a.rb", source)
+    out = tmp_path / "out"
+    out.mkdir()
+    subprocess.run(
+        ["ruby", "-Ilib", "-e", "require 'a'; A.new.once(1)"],
+        cwd=tmp_path, env=ruby_coverage_env(tmp_path, out), check=True,
+    )
+    record = parse_simplecov([p.read_text() for p in out.glob(".resultset-*.json")])
+    bundle = CoverageBundle(lcov=record)
+    scores = {
+        fn.name: bundle.percent_for(fn)
+        for fn in functions_in_source(source, str(lib.resolve()), str(tmp_path))
+    }
+    assert scores == {"never": 0.0, "once": 100.0}

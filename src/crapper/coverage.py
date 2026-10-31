@@ -28,6 +28,8 @@ _DOCTYPE = re.compile(r"<!DOCTYPE[^>]*>", re.IGNORECASE)
 # Ruby's Coverage keys a branch as `[:type, id, start_line, start_col, end_line, end_col]`.
 # Safe navigation is quoted: `[:"&.", 0, 3, 4, 3, 9]`.
 _RUBY_BRANCH = re.compile(r'\[:?(?:"[^"]*"|\w+), *\d+, *(\d+),')
+# A method is `[Class, :name, start_line, start_col, end_line, end_col]`.
+_RUBY_METHOD = re.compile(r"(\d+), *\d+, *\d+, *\d+\]$")
 
 
 class FileCoverage(dict):
@@ -35,12 +37,14 @@ class FileCoverage(dict):
 
     The mapping itself is `line → (covered, total)` from `DA` records, so
     existing callers can keep indexing it. `branches` aggregates each `BRDA`
-    record on that line as one branch.
+    record on that line as one branch. `methods` maps a Ruby method's first
+    line to whether any process called it.
     """
 
     def __init__(self):
         super().__init__()
         self.branches: dict[int, tuple[int, int]] = {}
+        self.methods: dict[int, bool] = {}
 
 
 def normalize_path(path: str) -> str:
@@ -336,6 +340,19 @@ def _add_ruby_branches(record: FileCoverage, branches, hits: dict) -> None:
             hits[key] = hits.get(key, False) or taken
 
 
+def _add_ruby_methods(record: FileCoverage, methods) -> None:
+    """A method called in any process or suite is called."""
+
+    if not isinstance(methods, dict):
+        return
+    for key, calls in methods.items():
+        match = _RUBY_METHOD.search(key)
+        if match is None:
+            continue
+        line = int(match.group(1))
+        record.methods[line] = record.methods.get(line, False) or (isinstance(calls, int) and calls > 0)
+
+
 def _ruby_file(entry, record: FileCoverage, hits: dict) -> None:
     if isinstance(entry, list):
         # SimpleCov before 0.18 stored the line array directly.
@@ -344,6 +361,7 @@ def _ruby_file(entry, record: FileCoverage, hits: dict) -> None:
     if isinstance(entry, dict):
         _add_ruby_lines(record, entry.get("lines"))
         _add_ruby_branches(record, entry.get("branches"), hits)
+        _add_ruby_methods(record, entry.get("methods"))
 
 
 def _store_ruby_branches(out: dict[str, FileCoverage], hits: dict[str, dict]) -> None:
@@ -547,16 +565,28 @@ class CoverageBundle:
         record = self._lcov_lines(function.path)
         if record is None:
             return None
-        branched = branch_percent(record, function.start_line, function.end_line)
-        if branched is not None:
-            return branched
-        return percent_for_range(record, function.start_line, function.end_line)
+        return _record_percent(record, function)
 
     def _html_lines(self, path: str) -> dict[int, tuple[int, int]] | None:
         return _lookup(self.form_html, path, self.source_parts)
 
     def _lcov_lines(self, path: str) -> dict[int, tuple[int, int]] | None:
         return _lookup(self.lcov, path, self.source_parts)
+
+
+def _record_percent(record, function: Function) -> float:
+    """Branches when the span has any, else line hits.
+
+    A Ruby method the run recorded and never called is 0%. Its `def` line
+    still ran when the class loaded, so its lines alone would not say so.
+    """
+
+    if getattr(record, "methods", {}).get(function.start_line) is False:
+        return 0.0
+    branched = branch_percent(record, function.start_line, function.end_line)
+    if branched is not None:
+        return branched
+    return percent_for_range(record, function.start_line, function.end_line)
 
 
 def _lookup(index: dict[str, dict], source_path: str, source_parts: list[tuple[str, ...]]):
