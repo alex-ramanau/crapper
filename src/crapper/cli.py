@@ -80,7 +80,7 @@ Coverage, when it is produced:
   Rust         cargo llvm-cov, or cargo tarpaulin, in the nearest Cargo.toml
   Python       coverage.py LCOV, via pytest or unittest, per project
   Ruby         Ruby's Coverage (or the project's SimpleCov) around rspec,
-               rake test, or test/, per Gemfile
+               rake test, or test/, per Gemfile or gemspec
 
 uml-viewer joins .metrics/crap.edn on :namespace and :name.
   Clojure      the ns, and the defn name

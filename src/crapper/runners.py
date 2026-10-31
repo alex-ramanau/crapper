@@ -411,32 +411,71 @@ _RUBY_TEST_LOADER = (
 )
 
 
+_GEMFILES = ("Gemfile", "gems.rb")
+_BUNDLE_FILES = ("Gemfile.lock", "Gemfile", "gems.rb", "gems.locked")
+
+
+def _is_ruby_package(directory: Path) -> bool:
+    if any((directory / name).is_file() for name in _GEMFILES):
+        return True
+    return any(directory.glob("*.gemspec"))
+
+
+def _ancestors(start: Path, stop: Path) -> list[Path]:
+    """`start` and each parent up to and including `stop`."""
+
+    found = [start]
+    stop = stop.resolve()
+    current = start
+    while current != stop and current.parent != current:
+        current = current.parent
+        found.append(current)
+    return found
+
+
 def ruby_roots(root: Path, files: list[Path]) -> list[Path]:
-    """The nearest directory with a Gemfile for each Ruby file, else the root."""
+    """The nearest directory with a Gemfile or a gemspec, else the root.
+
+    A monorepo like Rails has one Gemfile on top and a gemspec per component,
+    so each component runs its own tests.
+    """
 
     found: set[Path] = set()
     root = root.resolve()
     for file in files:
         if language_of(file) != "ruby":
             continue
-        found.add((_nearest(Path(file), "Gemfile", root) or root).resolve())
+        packages = [path for path in _ancestors(Path(file).resolve().parent, root) if _is_ruby_package(path)]
+        found.add(packages[0] if packages else root)
     return sorted(found)
 
 
-def uses_simplecov(package: Path) -> bool:
-    """A project that starts SimpleCov itself keeps it. Ruby allows one Coverage run."""
-
-    for name in ("Gemfile.lock", "Gemfile", "gems.rb", "gems.locked"):
-        path = package / name
-        if path.is_file() and "simplecov" in path.read_text(encoding="utf-8", errors="replace"):
-            return True
-    return False
+def _bundle_texts(package: Path, root: Path):
+    for directory in _ancestors(package.resolve(), root):
+        for name in _BUNDLE_FILES:
+            path = directory / name
+            if path.is_file():
+                yield name, path.read_text(encoding="utf-8", errors="replace")
 
 
-def ruby_test_command(package: Path) -> list[str] | None:
+def uses_simplecov(package: Path, root: Path | None = None) -> bool:
+    """A project that starts SimpleCov itself keeps it. Ruby allows one Coverage run.
+
+    Bundler finds a Gemfile in a parent directory, so the parents up to the
+    project root count too.
+    """
+
+    return any("simplecov" in text for _name, text in _bundle_texts(package, root or package))
+
+
+def _bundled(package: Path, root: Path) -> bool:
+    return any(name in _GEMFILES for name, _text in _bundle_texts(package, root))
+
+
+def ruby_test_command(package: Path, root: Path | None = None) -> list[str] | None:
     """RSpec when there is a spec/ tree, `rake test` with a Rakefile, else each test file."""
 
-    bundle = ["bundle", "exec"] if (package / "Gemfile").is_file() else []
+    bundle = ["bundle", "exec"] if _bundled(package, root or package) else []
     if (package / ".rspec").is_file() or (package / "spec").is_dir():
         return [*bundle, "rspec"]
     if any((package / name).is_file() for name in _RAKEFILES):
@@ -637,23 +676,25 @@ def _cover_rust(root: Path, files: list[Path]) -> None:
             _warn(f"Rust coverage exited {code} in {module}. Rust coverage will score 0%.")
 
 
-def _run_ruby_tests(root: Path, package: Path, command: list[str]) -> int:
-    if uses_simplecov(package):
+def _ruby_env(root: Path, package: Path) -> dict[str, str] | None:
+    """The shim's environment, or None when the project's SimpleCov runs instead."""
+
+    if uses_simplecov(package, root):
         (package / "coverage" / ".resultset.json").unlink(missing_ok=True)
-        return run_shell(command, package)
+        return None
     report_dir = _coverage_report(root, package, "ruby").parent
     _clear_resultsets(report_dir)
     report_dir.mkdir(parents=True, exist_ok=True)
-    return run_shell(command, package, env=ruby_coverage_env(package, report_dir))
+    return ruby_coverage_env(package, report_dir)
 
 
 def _cover_ruby(root: Path, files: list[Path]) -> None:
     for package in ruby_roots(root, files):
-        command = ruby_test_command(package)
+        command = ruby_test_command(package, root)
         if command is None:
             _warn(f"No spec/, Rakefile, or test/ in {package}; skipping Ruby coverage.")
             continue
-        code = _run_ruby_tests(root, package, command)
+        code = run_shell(command, package, env=_ruby_env(root, package))
         if code != 0:
             _warn(f"Ruby tests exited {code} in {package}. Coverage they recorded is still read.")
 
@@ -676,14 +717,22 @@ def _coverers():
 def run_coverage(root: Path, files: list[Path], command: str | None) -> int:
     """Generate coverage reports for the languages present in `files`.
 
-    Returns the custom command's status. A non-zero status means the caller
+    A custom command runs at the root, with the Ruby shim in its environment
+    when there are Ruby files. Returns the custom command's status. A non-zero
+    status means the caller
     must not read reports already on disk. Per-language runs return 0; a
     failed tool is reported and that language scores 0% when it wrote nothing.
     """
 
     root = root.resolve()
     if command:
-        code = run_shell(command, root)
+        # A Ruby process the command starts still records coverage.
+        if "ruby" in _languages_in(files):
+            # Per-package results from an earlier default run would be stale.
+            _clean_dir(root / "target" / "coverage" / "ruby")
+            code = run_shell(command, root, env=_ruby_env(root, root))
+        else:
+            code = run_shell(command, root)
         if code != 0:
             _warn(
                 f"Coverage command exited {code}. "

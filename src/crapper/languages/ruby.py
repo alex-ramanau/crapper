@@ -7,7 +7,9 @@ modifier forms (`x if y`, `x rescue y`, ...), each `&&` / `||` / `and` /
 
 `def` and `def self.` are entries. A method defined inside another method,
 and every block or lambda, stays inside the enclosing method. The namespace
-is the lexical `module` / `class` nesting joined with `::`. A singleton
+is the lexical `module` / `class` nesting joined with `::`, where
+`Point = Struct.new do ... end` (or `Class.new`, `Data.define`) counts as
+class `Point`. A singleton
 method (`def self.x`, or `def x` inside `class << self`) is named `self.x`.
 A method outside any class or module is namespaced by its file path, without
 the `lib/` or `src/` prefix and the `.rb` suffix.
@@ -109,6 +111,28 @@ def _scope_name(data: bytes, node) -> str | None:
     return node_text(data, name).lstrip(":")
 
 
+def _assigned_constant(data: bytes, block) -> str | None:
+    """`Point = Struct.new(:x) do ... end` names a class, as `Class.new`,
+    `Module.new`, and `Data.define` do. The block's methods belong to it."""
+
+    call = block.parent
+    assignment = call.parent if call is not None else None
+    if assignment is None or assignment.type != "assignment":
+        return None
+    target = assignment.child_by_field_name("left")
+    if target.type not in {"constant", "scope_resolution"}:
+        return None
+    return node_text(data, target).removeprefix("self::").lstrip(":")
+
+
+def _scope_of(data: bytes, node) -> str | None:
+    if node.type in _SCOPES:
+        return _scope_name(data, node)
+    if node.type in {"block", "do_block"}:
+        return _assigned_constant(data, node)
+    return None
+
+
 def _is_nested_method(node) -> bool:
     current = node.parent
     while current is not None:
@@ -126,10 +150,9 @@ def _enclosing(data: bytes, node) -> tuple[list[str], bool]:
     singleton = False
     current = node.parent
     while current is not None:
-        if current.type in _SCOPES:
-            name = _scope_name(data, current)
-            if name:
-                names.append(name)
+        name = _scope_of(data, current)
+        if name:
+            names.append(name)
         elif current.type == "singleton_class" and not names:
             singleton = True
         current = current.parent

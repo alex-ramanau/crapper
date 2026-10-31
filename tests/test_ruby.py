@@ -385,3 +385,65 @@ def test_shim_records_lines_and_branches_from_a_real_ruby(tmp_path):
     record = coverage[str(lib.resolve())]
     assert record.branches == {2: (2, 2)}
     assert dict(record) == {1: (1, 1), 2: (1, 1), 3: (1, 1), 5: (1, 1)}
+
+
+def test_a_constant_assigned_a_block_names_its_methods():
+    source = """
+module Adapters
+  Key = Struct.new(:from, :options) do
+    def name
+      options[:name] if options
+    end
+  end
+  self::Point = Data.define(:x) { def norm = x }
+  Klass = Class.new(Base) do
+    class << self
+      def build; end
+    end
+  end
+  HANDLERS = Hash.new { |h, k| h[k] = [] }
+  handler = proc do
+    def loose; end
+  end
+end
+"""
+    assert _rows(source) == [
+        ("Adapters::Key", "name", 2),
+        ("Adapters::Point", "norm", 1),
+        ("Adapters::Klass", "self.build", 1),
+        ("Adapters", "loose", 1),
+    ]
+
+
+def test_a_monorepo_runs_each_gemspec_component(tmp_path):
+    _touch(tmp_path / "Gemfile", "gemspec path: 'support'\n")
+    _touch(tmp_path / "Gemfile.lock", "    rake (13.0)\n")
+    support = tmp_path / "support"
+    _touch(support / "support.gemspec")
+    _touch(support / "Rakefile")
+    source = _touch(support / "lib" / "support" / "core.rb")
+    tool = _touch(tmp_path / "tools" / "release.rb")
+    assert ruby_roots(tmp_path, [source, tool]) == [tmp_path.resolve(), support.resolve()]
+    assert ruby_test_command(support, tmp_path) == ["bundle", "exec", "rake", "test"]
+    assert ruby_test_command(support) == ["rake", "test"]
+    assert not uses_simplecov(support, tmp_path)
+    _touch(tmp_path / "Gemfile.lock", "    simplecov (0.22.0)\n")
+    assert uses_simplecov(support, tmp_path)
+    assert not uses_simplecov(support)
+
+
+def test_a_custom_command_records_ruby_coverage(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "crapper.runners.run_shell",
+        lambda command, cwd, env=None: calls.append((command, env)) or 0,
+    )
+    stale = _touch(tmp_path / "target" / "coverage" / "ruby" / ".resultset-1.json")
+    nested = _touch(tmp_path / "target" / "coverage" / "ruby" / "alpha" / ".resultset-2.json")
+    assert run_coverage(tmp_path, [_touch(tmp_path / "lib" / "a.rb")], "cd sub && bin/test") == 0
+    command, env = calls[-1]
+    assert command == "cd sub && bin/test"
+    assert env["CRAPPER_RUBY_COVERAGE_ROOT"] == str(tmp_path.resolve())
+    assert not stale.exists() and not nested.exists()
+    run_coverage(tmp_path, [_touch(tmp_path / "web" / "a.py")], "pytest")
+    assert calls[-1] == ("pytest", None)
