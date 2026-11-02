@@ -9,6 +9,7 @@ _SOURCES = [
     ("typescript", "export function view() { return 1 }\n", "src/ui.ts", "view"),
     ("python", "def run():\n    return 1\n", "src/app.py", "run"),
     ("rust", "pub fn open() {}\n", "src/lib.rs", "open"),
+    ("ruby", "def run\n  1\nend\n", "lib/app.rb", "run"),
 ]
 
 
@@ -20,4 +21,4 @@ def test_each_language_answers_the_same_message(language, source, path, name):
 
 
 def test_unknown_language_has_no_functions():
-    assert functions_in_file("ruby", "def x\nend\n", "a.rb", "/proj") == []
+    assert functions_in_file("cobol", "PROCEDURE DIVISION.\n", "a.cbl", "/proj") == []

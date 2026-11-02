@@ -20,6 +20,7 @@ EXTENSIONS = {
     ".cjs": "typescript",
     ".rs": "rust",
     ".py": "python",
+    ".rb": "ruby",
 }
 
 SKIP_DIRS = {
@@ -40,11 +41,13 @@ SKIP_DIRS = {
     "testdata",
     "__pycache__",
     ".clj-kondo",
+    ".bundle",
 }
 
 TEST_DIRS = {"test", "tests", "spec", "specs", "__tests__"}
 
 GO_TEST_SUFFIX = "_test.go"
+RUBY_TEST_SUFFIXES = ("_spec.rb", "_test.rb")
 CLOJURE_TEST_SUFFIXES = ("_test.clj", "_test.cljc", "_test.cljs", "_test.bb")
 JS_TEST_SUFFIXES = (
     ".test.ts",
@@ -74,18 +77,22 @@ def language_of(path: str | Path) -> str | None:
     return EXTENSIONS.get(file_path.suffix)
 
 
+_TEST_SUFFIXES = (
+    GO_TEST_SUFFIX,
+    *CLOJURE_TEST_SUFFIXES,
+    *JS_TEST_SUFFIXES,
+    "_test.py",
+    *RUBY_TEST_SUFFIXES,
+)
+_TEST_PREFIXED = (".py", ".rb")
+
+
 def is_test_file(path: str | Path) -> bool:
     file_path = Path(path)
     name = file_path.name
-    if name.endswith(GO_TEST_SUFFIX):
+    if name == "conftest.py" or name.endswith(_TEST_SUFFIXES):
         return True
-    if name.endswith(CLOJURE_TEST_SUFFIXES):
-        return True
-    if name.endswith(JS_TEST_SUFFIXES):
-        return True
-    if name == "conftest.py":
-        return True
-    if name.endswith("_test.py") or (name.startswith("test_") and name.endswith(".py")):
+    if name.startswith("test_") and name.endswith(_TEST_PREFIXED):
         return True
     return any(part in TEST_DIRS for part in file_path.parts)
 

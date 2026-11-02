@@ -7,10 +7,12 @@ tool, or a failed run, scores its functions at 0%.
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from crapper.discover import is_test_file, language_of
@@ -34,20 +36,21 @@ def _show(command: str | list[str]) -> str:
     return " ".join(shlex.quote(part) for part in command)
 
 
-def run_shell(command: str | list[str], cwd: Path) -> int:
+def run_shell(command: str | list[str], cwd: Path, env: dict[str, str] | None = None) -> int:
     """Run a coverage command.
 
     A list is an argument vector and does not go through a shell, so a path
     with spaces or metacharacters stays one argument. A string is a command
-    the user typed in `--coverage-command` and runs in a shell.
+    the user typed in `--coverage-command` and runs in a shell. `env`, when
+    given, is the whole environment of the child.
     """
 
     _warn(f"+ ({cwd}) {_show(command)}")
     try:
         if isinstance(command, str):
-            completed = subprocess.run(command, cwd=cwd, shell=True)
+            completed = subprocess.run(command, cwd=cwd, shell=True, env=env)
         else:
-            completed = subprocess.run(list(command), cwd=cwd)
+            completed = subprocess.run(list(command), cwd=cwd, env=env)
     except OSError as exc:
         _warn(f"Coverage command failed to start: {exc}")
         return 127
@@ -70,7 +73,7 @@ def _clean_dir(path: Path) -> None:
         shutil.rmtree(path)
 
 
-_COVERAGE_DIRS = {"typescript", "rust", "go", "python"}
+_COVERAGE_DIRS = {"typescript", "rust", "go", "python", "ruby"}
 
 
 def _outside_language_dirs(coverage: Path, path: Path) -> bool:
@@ -401,6 +404,104 @@ def _ensure_python_module(py: str, package: Path, module: str) -> bool:
     return code == 0
 
 
+_RUBY_SHIM = Path(__file__).parent / "ruby" / "crapper_coverage.rb"
+_RAKEFILES = ("Rakefile", "rakefile", "Rakefile.rb", "rakefile.rb")
+_RUBY_TEST_LOADER = (
+    'Dir.glob("test/**/{*_test,test_*}.rb").sort.each { |f| require File.expand_path(f) }'
+)
+
+
+_GEMFILES = ("Gemfile", "gems.rb")
+
+
+def _is_ruby_package(directory: Path) -> bool:
+    if any((directory / name).is_file() for name in _GEMFILES):
+        return True
+    return any(directory.glob("*.gemspec"))
+
+
+def _ancestors(start: Path, stop: Path) -> list[Path]:
+    """`start` and each parent up to and including `stop`."""
+
+    found = [start]
+    stop = stop.resolve()
+    current = start
+    while current != stop and current.parent != current:
+        current = current.parent
+        found.append(current)
+    return found
+
+
+def ruby_roots(root: Path, files: list[Path]) -> list[Path]:
+    """The nearest directory with a Gemfile or a gemspec, else the root.
+
+    A monorepo like Rails has one Gemfile on top and a gemspec per component,
+    so each component runs its own tests.
+    """
+
+    found: set[Path] = set()
+    root = root.resolve()
+    for file in files:
+        if language_of(file) != "ruby":
+            continue
+        packages = [path for path in _ancestors(Path(file).resolve().parent, root) if _is_ruby_package(path)]
+        found.add(packages[0] if packages else root)
+    return sorted(found)
+
+
+def _bundled(package: Path, root: Path) -> bool:
+    """Bundler finds a Gemfile in a parent directory too."""
+
+    return any(
+        (directory / name).is_file()
+        for directory in _ancestors(package.resolve(), root)
+        for name in _GEMFILES
+    )
+
+
+def ruby_test_command(package: Path, root: Path | None = None) -> list[str] | None:
+    """RSpec when there is a spec/ tree, `rake test` with a Rakefile, else each test file."""
+
+    bundle = ["bundle", "exec"] if _bundled(package, root or package) else []
+    if (package / ".rspec").is_file() or (package / "spec").is_dir():
+        return [*bundle, "rspec"]
+    if any((package / name).is_file() for name in _RAKEFILES):
+        return [*bundle, "rake", "test"]
+    if (package / "test").is_dir():
+        return [*bundle, "ruby", "-Ilib", "-Itest", "-e", _RUBY_TEST_LOADER]
+    return None
+
+
+def _ruby_shim() -> Path:
+    """RUBYOPT splits on whitespace, so a shim path with a space is copied first."""
+
+    if not any(char.isspace() for char in str(_RUBY_SHIM)):
+        return _RUBY_SHIM
+    copy = Path(tempfile.mkdtemp(prefix="crapper-")) / _RUBY_SHIM.name
+    shutil.copyfile(_RUBY_SHIM, copy)
+    return copy
+
+
+def ruby_coverage_env(
+    package: Path, report_dir: Path, base: dict[str, str] | None = None
+) -> dict[str, str]:
+    env = dict(os.environ if base is None else base)
+    options = env.get("RUBYOPT", "").strip()
+    env["RUBYOPT"] = f"{options} -r{_ruby_shim()}".strip()
+    env["CRAPPER_RUBY_COVERAGE_DIR"] = str(report_dir)
+    env["CRAPPER_RUBY_COVERAGE_ROOT"] = str(package)
+    return env
+
+
+def _clear_resultsets(report_dir: Path) -> None:
+    """Only this package's files. A nested package keeps its own directory."""
+
+    if not report_dir.is_dir():
+        return
+    for path in report_dir.glob(".resultset*.json"):
+        path.unlink()
+
+
 def rust_coverage_command(kind: str, report: Path) -> list[str]:
     if kind == "llvm-cov":
         return ["cargo", "llvm-cov", "--lcov", "--output-path", str(report)]
@@ -562,17 +663,67 @@ def _cover_rust(root: Path, files: list[Path]) -> None:
             _warn(f"Rust coverage exited {code} in {module}. Rust coverage will score 0%.")
 
 
+def _ruby_env(root: Path, package: Path) -> dict[str, str]:
+    """The shim's environment. A project that starts SimpleCov joins the
+    shim's Coverage session, so the shim always runs.
+
+    SimpleCov's own resultset is removed first: when this run does not start
+    SimpleCov (RuboCop only starts it under `COVERAGE=1 rake`), a leftover
+    one would count as coverage from this run.
+    """
+
+    (package / "coverage" / ".resultset.json").unlink(missing_ok=True)
+    report_dir = _coverage_report(root, package, "ruby").parent
+    _clear_resultsets(report_dir)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    return ruby_coverage_env(package, report_dir)
+
+
+def _cover_ruby(root: Path, files: list[Path]) -> None:
+    for package in ruby_roots(root, files):
+        command = ruby_test_command(package, root)
+        if command is None:
+            _warn(f"No spec/, Rakefile, or test/ in {package}; skipping Ruby coverage.")
+            continue
+        code = run_shell(command, package, env=_ruby_env(root, package))
+        if code != 0:
+            _warn(f"Ruby tests exited {code} in {package}. Coverage they recorded is still read.")
+
+
+def _coverers():
+    """Each language's coverage run, in a fixed order. Looked up per call so a
+    test can replace one."""
+
+    return (
+        ("clojure", lambda root, _files: _cover_clojure(root)),
+        ("java", _cover_java),
+        ("go", _cover_go),
+        ("typescript", _cover_typescript),
+        ("python", _cover_python),
+        ("rust", _cover_rust),
+        ("ruby", _cover_ruby),
+    )
+
+
 def run_coverage(root: Path, files: list[Path], command: str | None) -> int:
     """Generate coverage reports for the languages present in `files`.
 
-    Returns the custom command's status. A non-zero status means the caller
+    A custom command runs at the root, with the Ruby shim in its environment
+    when there are Ruby files. Returns the custom command's status. A non-zero
+    status means the caller
     must not read reports already on disk. Per-language runs return 0; a
     failed tool is reported and that language scores 0% when it wrote nothing.
     """
 
     root = root.resolve()
     if command:
-        code = run_shell(command, root)
+        # A Ruby process the command starts still records coverage.
+        if "ruby" in _languages_in(files):
+            # Per-package results from an earlier default run would be stale.
+            _clean_dir(root / "target" / "coverage" / "ruby")
+            code = run_shell(command, root, env=_ruby_env(root, root))
+        else:
+            code = run_shell(command, root)
         if code != 0:
             _warn(
                 f"Coverage command exited {code}. "
@@ -581,16 +732,7 @@ def run_coverage(root: Path, files: list[Path], command: str | None) -> int:
         return code
 
     languages = _languages_in(files)
-    if "clojure" in languages:
-        _cover_clojure(root)
-    if "java" in languages:
-        _cover_java(root, files)
-    if "go" in languages:
-        _cover_go(root, files)
-    if "typescript" in languages:
-        _cover_typescript(root, files)
-    if "python" in languages:
-        _cover_python(root, files)
-    if "rust" in languages:
-        _cover_rust(root, files)
+    for language, cover in _coverers():
+        if language in languages:
+            cover(root, files)
     return 0
